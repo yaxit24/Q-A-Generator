@@ -16,6 +16,12 @@ from tqdm import tqdm
 import logging
 import sys
 import subprocess
+import argparse
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Document Q&A Generator')
+parser.add_argument('--port', type=int, default=5001, help='Port to run the web server on')
+args = parser.parse_args()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -32,9 +38,9 @@ def is_ollama_available():
         return False
 
 # Initialize NLP model for question generation
-def initialize_model(use_ollama=False, model_name="valhalla/t5-small-e2e-qg"):
-    # Check if Ollama is available, and use it by default because of the protobuf issues
-    if is_ollama_available():
+def initialize_model(use_ollama=True, model_name="valhalla/t5-small-e2e-qg"):
+    # Try to use Ollama by default
+    if is_ollama_available() and use_ollama:
         logger.info("Using Ollama for question generation")
         try:
             import ollama
@@ -43,14 +49,13 @@ def initialize_model(use_ollama=False, model_name="valhalla/t5-small-e2e-qg"):
             logger.warning("Ollama Python package not found")
     
     # Only if Ollama is not available or explicitly requested not to use it
-    if not is_ollama_available():
-        logger.info(f"Using transformers pipeline with model: {model_name}")
-        try:
-            return "transformers", pipeline("text2text-generation", model=model_name)
-        except Exception as e:
-            logger.error(f"Error initializing transformers model: {str(e)}")
-            logger.info("Falling back to simple question generation")
-            return "simple", None
+    logger.info(f"Using transformers pipeline with model: {model_name}")
+    try:
+        return "transformers", pipeline("text2text-generation", model=model_name)
+    except Exception as e:
+        logger.error(f"Error initializing transformers model: {str(e)}")
+        logger.info("Falling back to simple question generation")
+        return "simple", None
 
 # Step 1: Document Ingestion and Parsing
 def extract_text_and_images(pdf_path):
@@ -168,55 +173,98 @@ def generate_simple_questions(text):
     sentences = text.split('.')
     qa_pairs = []
     
+    # Group 3-5 related sentences together for more context
+    contextual_chunks = []
+    current_chunk = []
+    
     for sentence in sentences:
         sentence = sentence.strip()
-        if len(sentence.split()) >= 8 and len(sentence) > 40:  # Only use substantial sentences
-            words = sentence.split()
+        if len(sentence) > 30:  # Only consider substantial sentences
+            current_chunk.append(sentence)
             
-            # Create different types of questions based on the sentence content
-            if any(word.lower() in ["is", "are", "was", "were"] for word in words):
-                # Yes/No question
-                question = f"Is it true that {sentence.lower()}?"
-            elif len(words) > 10:
-                # What question using first part of sentence
-                question = f"What {' '.join(words[:5])}...?"
-            elif any(word.lower() in ["develop", "create", "build", "make", "implement"] for word in words):
-                # How question
-                question = f"How would you {' '.join(words[:3])}...?"
-            elif any(word.lower() in ["because", "since", "due to", "reason"] for word in words):
-                # Why question
-                question = f"Why {' '.join(words[:5])}...?"
-            else:
-                # Default question format
-                question = f"What can you tell me about {' '.join(words[:min(5, len(words))])}...?"
+            # Once we have 3-5 sentences, create a chunk
+            if len(current_chunk) >= 3:
+                contextual_chunks.append(" ".join(current_chunk))
+                # Keep the last sentence for overlap
+                current_chunk = [current_chunk[-1]] if current_chunk else []
+    
+    # Add any remaining sentences as a chunk
+    if current_chunk:
+        contextual_chunks.append(" ".join(current_chunk))
+    
+    # Generate questions for each contextual chunk
+    for chunk in contextual_chunks:
+        if len(chunk.split()) < 15:  # Skip very short chunks
+            continue
             
-            # Ensure the question passes quality checks
+        words = chunk.split()
+        
+        # Create different types of detailed questions based on the content
+        questions = []
+        
+        # Extract key nouns from the first 10 words to use as topics
+        first_part = " ".join(words[:10])
+        # Find topics (likely nouns) - look for capitalized words or words longer than 5 chars
+        potential_topics = [w for w in words[:15] if len(w) > 5 or (w[0].isupper() and len(w) > 3)]
+        topics = potential_topics[:2]  # Take at most 2 topics
+        
+        if topics:
+            topic_text = " and ".join(topics)
+            questions.append(f"What is explained about {topic_text} in this section?")
+            
+            if "policy" in chunk.lower() or "procedure" in chunk.lower() or "guideline" in chunk.lower():
+                questions.append(f"What are the key requirements related to {topic_text}?")
+            
+            if "should" in chunk.lower() or "must" in chunk.lower() or "require" in chunk.lower():
+                questions.append(f"What are the obligations regarding {topic_text}?")
+                
+            # More intelligent contextual questions
+            if any(term in chunk.lower() for term in ["purpose", "goal", "objective", "aim"]):
+                questions.append(f"What is the purpose described in this section?")
+                
+            if any(term in chunk.lower() for term in ["responsible", "responsibility", "accountable"]):
+                questions.append(f"Who is responsible for the activities described here?")
+                
+            if any(term in chunk.lower() for term in ["prohibited", "not allowed", "forbidden", "restricted"]):
+                questions.append(f"What activities are prohibited according to this text?")
+        else:
+            # Fallback questions if no good topics found
+            questions.append("What is the main point of this section?")
+            questions.append("What information is being conveyed in this text?")
+        
+        # Add questions that pass quality check
+        for question in questions:
             if quality_check_question(question):
                 qa_pairs.append({
                     "question": question,
-                    "answer": sentence,
-                    "source": "simple"
+                    "answer": chunk,  # Use the entire contextual chunk as the answer
+                    "source": "simple-detailed"
                 })
+                
+                # Limit to 3 questions per chunk to avoid redundancy
+                if len(qa_pairs) % 3 == 0:
+                    break
     
-    return qa_pairs
+    # Ensure we don't return too many questions
+    return qa_pairs[:20]
 
 # Step 5: Q&A Generation
-def generate_questions(text, model_info, max_questions=10):
+def generate_questions(text, model_info, max_questions=20):
     model_type, model = model_info
     
-    # Split text into chunks for efficiency and to handle long documents
-    chunk_size = 500
-    overlap = 100
+    # Split text into larger chunks for more context and detailed answers
+    chunk_size = 1000  # Increased from 600
+    overlap = 250      # Increased from 150
     chunks = []
     
     # Create overlapping chunks
     for i in range(0, len(text), chunk_size - overlap):
         chunk = text[i:i + chunk_size]
-        if len(chunk.strip()) > 50:  # Only use chunks with sufficient content
+        if len(chunk.strip()) > 100:  # Only use chunks with more substantial content (increased from 50)
             chunks.append(chunk)
     
     # Limit number of chunks to process
-    max_chunks = 50
+    max_chunks = 100
     if len(chunks) > max_chunks:
         logger.info(f"Limiting to {max_chunks} chunks for processing")
         chunks = chunks[:max_chunks]
@@ -229,8 +277,8 @@ def generate_questions(text, model_info, max_questions=10):
             for chunk in tqdm(chunks, desc="Generating questions"):
                 if chunk.strip():
                     try:
-                        # Generate questions using transformer model
-                        questions = model(chunk, max_length=64, num_return_sequences=2)
+                        # Generate questions using transformer model with higher max_length
+                        questions = model(chunk, max_length=128, num_return_sequences=3)  # Increased from 64
                         
                         for q in questions:
                             question_text = q["generated_text"].strip()
@@ -266,11 +314,23 @@ def generate_questions(text, model_info, max_questions=10):
                 ollama_failed = True
             
             if not ollama_failed:
-                for chunk in tqdm(chunks[:20], desc="Generating questions with Ollama"):  # Limit chunks for Ollama
+                # Increase from 40 to 50 chunks for Ollama
+                for chunk in tqdm(chunks[:50], desc="Generating questions with Ollama"):
                     if chunk.strip():
                         try:
-                            # Generate questions using Ollama
-                            prompt = f"Generate 2 factual questions based on this text. Only output the questions, nothing else:\n\n{chunk}"
+                            # Ask Ollama to generate more detailed questions with longer answers
+                            prompt = f"""Generate 3 high-quality, focused questions based on this text. 
+                            The questions should:
+                            1. Focus on the most important or useful information in the text
+                            2. Be clear, concise, and grammatically correct
+                            3. Require detailed knowledge of the text to answer
+                            4. Not be overly complicated or use complex language
+                            5. Cover different aspects of the information when possible
+                            
+                            Format each question as a complete sentence with a question mark.
+                            Only output the questions, nothing else:
+
+                            {chunk}"""
                             response = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
                             
                             # Parse questions from response
@@ -278,11 +338,40 @@ def generate_questions(text, model_info, max_questions=10):
                             
                             for question in questions:
                                 if quality_check_question(question):
-                                    qa_pairs.append({
-                                        "question": question,
-                                        "answer": chunk.strip(),
-                                        "source": "ollama"
-                                    })
+                                    # Generate a more detailed answer for this question based on the chunk
+                                    answer_prompt = f"""Based on this information:
+                                    {chunk}
+                                    
+                                    Please provide a clear, comprehensive answer to this question:
+                                    {question}
+                                    
+                                    Your answer should:
+                                    1. Be factual and based only on the information provided
+                                    2. Be complete and thorough
+                                    3. Be well-organized and easy to understand
+                                    4. Use natural language without unnecessary technical terms
+                                    """
+                                    
+                                    try:
+                                        answer_response = ollama.chat(model=model, messages=[{"role": "user", "content": answer_prompt}])
+                                        detailed_answer = answer_response['message']['content'].strip()
+                                        
+                                        # Combine the original context with the generated answer
+                                        final_answer = detailed_answer if len(detailed_answer) > 100 else chunk.strip()
+                                        
+                                        qa_pairs.append({
+                                            "question": question,
+                                            "answer": final_answer,
+                                            "source": "ollama-detailed"
+                                        })
+                                    except Exception as e:
+                                        # Fall back to using the chunk as the answer
+                                        logger.error(f"Error generating detailed answer: {str(e)}")
+                                        qa_pairs.append({
+                                            "question": question,
+                                            "answer": chunk.strip(),
+                                            "source": "ollama"
+                                        })
                                     
                                     # Limit to max questions
                                     if len(qa_pairs) >= max_questions:
@@ -300,7 +389,7 @@ def generate_questions(text, model_info, max_questions=10):
     if len(qa_pairs) == 0 or model_type == "simple" or ollama_failed:
         logger.info("Using simple question generation")
         # Use the simple question generation method
-        for chunk in tqdm(chunks[:30], desc="Generating simple questions"):
+        for chunk in tqdm(chunks[:50], desc="Generating simple questions"):
             simple_qa_pairs = generate_simple_questions(chunk)
             qa_pairs.extend(simple_qa_pairs)
             
@@ -327,16 +416,43 @@ def quality_check_question(question):
         return False
     
     # Check if the question has a minimum length
-    if len(question.split()) < 5:
+    if len(question.split()) < 6:  # Increased from 5 to require more substantial questions
         return False
     
-    # Check if the question has a maximum length
-    if len(question.split()) > 25:
+    # Check if the question has a maximum length (increased for more detailed questions)
+    if len(question.split()) > 25:  # Reduced from 30 to make questions more focused
         return False
     
     # Check if the question starts with a question word
-    question_starters = ['what', 'who', 'where', 'when', 'why', 'how', 'which', 'can', 'does', 'do', 'is', 'are']
+    question_starters = ['what', 'who', 'where', 'when', 'why', 'how', 'which', 'can', 'does', 'do', 'is', 'are', 'could', 'would', 'should', 'explain']
     if not any(question.lower().startswith(starter) for starter in question_starters):
+        return False
+    
+    # Avoid questions that just echo back large portions of text
+    words = question.split()
+    question_length = len(words)
+    
+    # Check for ellipsis which may indicate truncated text
+    if "..." in question:
+        position = words.index("...")
+        if position < question_length - 2:  # If ellipsis is not near the end
+            return False
+    
+    # Avoid questions that look like they're cutting off sentences
+    if any(x in question for x in ["according to the passage", "as described in", "Can you provide a detailed explanation of"]):
+        # These phrases often appear in the poor quality template questions
+        if question.count("?") > 1 or question.count("...") > 0:
+            return False
+    
+    # Reject questions with very unnatural phrases (these appeared in your bad examples)
+    bad_phrases = [
+        "significance of", 
+        "implications of", 
+        "what is the significance",
+        "can you provide a detailed explanation"
+    ]
+    
+    if any(phrase in question.lower() for phrase in bad_phrases):
         return False
     
     return True
@@ -531,7 +647,7 @@ RESULTS_HTML = """
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 900px;
+            max-width: 1000px;
             margin: 0 auto;
             padding: 20px;
             line-height: 1.6;
@@ -541,34 +657,52 @@ RESULTS_HTML = """
         }
         .qa-pair {
             background-color: #f9f9f9;
-            padding: 15px;
-            margin-bottom: 15px;
-            border-radius: 5px;
-            border-left: 4px solid #3498db;
+            padding: 20px;
+            margin-bottom: 25px;
+            border-radius: 8px;
+            border-left: 5px solid #3498db;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
         .question {
             font-weight: bold;
             color: #2c3e50;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
+            font-size: 18px;
+            line-height: 1.4;
         }
         .answer {
-            color: #555;
+            color: #333;
             overflow-wrap: break-word;
+            white-space: pre-line;
+            padding: 10px;
+            background-color: #fff;
+            border-radius: 5px;
+            border-left: 3px solid #2ecc71;
+            font-size: 15px;
+            line-height: 1.5;
+            max-height: 400px;
+            overflow-y: auto;
         }
         .stats {
             background-color: #e8f4f8;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
         .back-btn {
             display: inline-block;
             margin-top: 20px;
             background-color: #3498db;
             color: white;
-            padding: 10px 20px;
+            padding: 12px 25px;
             text-decoration: none;
             border-radius: 5px;
+            font-weight: bold;
+            transition: background-color 0.3s;
+        }
+        .back-btn:hover {
+            background-color: #2980b9;
         }
         .highlight {
             font-weight: bold;
@@ -576,12 +710,44 @@ RESULTS_HTML = """
         }
         .download-btn {
             display: inline-block;
-            margin-left: 10px;
+            margin-left: 15px;
             background-color: #2ecc71;
             color: white;
-            padding: 10px 20px;
+            padding: 12px 25px;
             text-decoration: none;
             border-radius: 5px;
+            font-weight: bold;
+            transition: background-color 0.3s;
+        }
+        .download-btn:hover {
+            background-color: #27ae60;
+        }
+        .source-tag {
+            display: inline-block;
+            font-size: 12px;
+            background-color: #f1c40f;
+            color: #333;
+            padding: 3px 8px;
+            border-radius: 10px;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        .qa-controls {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .filter-btn {
+            margin: 0 5px;
+            padding: 8px 15px;
+            background-color: #ddd;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .filter-btn:hover, .filter-btn.active {
+            background-color: #3498db;
+            color: white;
         }
     </style>
 </head>
@@ -597,11 +763,16 @@ RESULTS_HTML = """
         <p><strong>Q&A Pairs Generated:</strong> <span class="highlight">{{ stats.num_qa_pairs }}</span></p>
     </div>
     
+    <div class="qa-controls">
+        <button class="filter-btn active" onclick="filterQA('all')">All</button>
+        <button class="filter-btn" onclick="filterQA('ollama')">Ollama Generated</button>
+    </div>
+    
     {% if qa_pairs %}
         {% for qa in qa_pairs %}
-        <div class="qa-pair">
+        <div class="qa-pair" data-source="{{ qa.source }}">
             <div class="question">Q: {{ qa.question }}</div>
-            <div class="answer">A: {{ qa.answer }}</div>
+            <div class="answer">{{ qa.answer }}</div>
         </div>
         {% endfor %}
     {% else %}
@@ -610,6 +781,28 @@ RESULTS_HTML = """
     
     <a href="/" class="back-btn">Process Another Document</a>
     <a href="/download" class="download-btn">Download Results (JSON)</a>
+    
+    <script>
+        function filterQA(filter) {
+            // Update active button
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            // Filter the QA pairs
+            document.querySelectorAll('.qa-pair').forEach(pair => {
+                const source = pair.getAttribute('data-source');
+                if (filter === 'all') {
+                    pair.style.display = 'block';
+                } else if (filter === 'ollama' && source.includes('ollama')) {
+                    pair.style.display = 'block';
+                } else {
+                    pair.style.display = 'none';
+                }
+            });
+        }
+    </script>
 </body>
 </html>
 """
@@ -711,5 +904,5 @@ def download_results():
 if __name__ == '__main__':
     print("Document Q&A System initializing...")
     print(f"Ollama available: {is_ollama_available()}")
-    print("Starting web server at http://localhost:5001")
-    app.run(debug=True, host='0.0.0.0', port=5001) 
+    print("Starting web server at http://localhost:" + str(args.port))
+    app.run(debug=True, host='0.0.0.0', port=args.port) 

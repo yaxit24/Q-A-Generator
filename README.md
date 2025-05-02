@@ -89,6 +89,7 @@ The system can also be used programmatically. See `qa_system.py` for details on 
 - Tesseract OCR
 - 4GB+ RAM
 - (Optional) Ollama for improved question generation
+- How to write HTML in a Python file (Never expected that writing HTML was possible in a Python file).
 
 ## What I Learnt 
 

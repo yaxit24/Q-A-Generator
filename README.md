@@ -51,7 +51,7 @@ Open your browser and go to [http://localhost:5000](http://localhost:5000)
 
 1. **Upload a Document**: Click on the upload area to select a PDF file (max 16MB)
 2. **Choose Processing Options**:
-   - Toggle the "Use Ollama" option if you have Ollama installed for higher quality questions
+   - Toggle the "Use Ollama" option if you have Ollama installed for higher-quality questions
 3. **Generate Q&A Pairs**: Click the "Generate Q&A Pairs" button and wait for processing
 4. **Review Results**: Examine the generated Q&A pairs and processing statistics
 5. **Download**: Use the "Download Results" button to save the results as JSON
@@ -80,8 +80,8 @@ The system can also be used programmatically. See `qa_system.py` for details on 
 
 - Processing time depends on document size, number of images, and tables
 - OCR operations are limited to the first 10 images to maintain performance
-- Text chunks are limited to 50 for question generation
-- The web interface limits upload size to 16MB to prevent server overload
+- Text chunks are limited to 20 for question generation
+
 
 ## Requirements
 
@@ -89,6 +89,13 @@ The system can also be used programmatically. See `qa_system.py` for details on 
 - Tesseract OCR
 - 4GB+ RAM
 - (Optional) Ollama for improved question generation
+
+## What I Learnt 
+
+- Using Python to build, which solves real-world problems for organisations.
+- Learnt about the various frameworks and libraries. 
+- Practiced the implementation of OOPs.
+- Learnt how to research, build in 24hrs using the AI for the SecurityPal x Nammi (NepalHacks 3.0) Hackathon.
 
 ## License
 
